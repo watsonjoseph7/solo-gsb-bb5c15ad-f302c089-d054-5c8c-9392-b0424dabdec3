@@ -1833,6 +1833,366 @@ def test_snapshot_consistency_ttl_boundaries_ok(client):
     assert [r["ttl"] for r in resp.json()["snapshot"]] == [0, 2**31 - 1]
 
 
+# ---------- IXFR 增量回放预演 ----------
+
+
+def _rr(owner, rtype, rrclass, ttl, rdata):
+    return {"owner": owner, "type": rtype, "class": rrclass, "ttl": ttl, "rdata": rdata}
+
+
+def _ixfr_payload(**overrides):
+    payload = {
+        "start_serial": 2026091900,
+        "initial_rrsets": [
+            _rrset("www.example.com", "A", "IN", 300, "192.0.2.1"),
+            _rrset("old.example.com", "A", "IN", 300, "192.0.2.9"),
+        ],
+        "deltas": [
+            {
+                "from_serial": 2026091900,
+                "to_serial": 2026091901,
+                "deletes": [_rr("old.example.com", "A", "IN", 300, "192.0.2.9")],
+                "adds": [_rr("www.example.com", "A", "IN", 300, "192.0.2.2")],
+            },
+            {
+                "from_serial": 2026091901,
+                "to_serial": 2026091902,
+                "deletes": [
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.1"),
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.2"),
+                ],
+                "adds": [
+                    _rr("www.example.com", "A", "IN", 600, "192.0.2.1"),
+                    _rr("www.example.com", "A", "IN", 600, "192.0.2.2"),
+                ],
+            },
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def test_ixfr_replay_success(client):
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=_ixfr_payload())
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["zone"] == "example.com"
+    assert body["start_serial"] == 2026091900
+    assert body["final_serial"] == 2026091902
+    assert body["deltas_applied"] == 2
+    assert body["steps"] == [
+        {"index": 0, "from_serial": 2026091900, "to_serial": 2026091901,
+         "deleted": 1, "added": 1},
+        {"index": 1, "from_serial": 2026091901, "to_serial": 2026091902,
+         "deleted": 2, "added": 2},
+    ]
+    # 最终快照：old 已删除，www 整体换到 TTL 600
+    assert body["snapshot"] == [
+        {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 600,
+         "rdata": ["192.0.2.1", "192.0.2.2"]}
+    ]
+
+
+def test_ixfr_replay_normalization(client):
+    # 属主大小写/末尾根点、类型/类大小写、rdata 空白与顺序在规范化后一致
+    payload = _ixfr_payload(
+        initial_rrsets=[
+            _rrset("WWW.Example.COM.", "a", "in", 300,
+                   " 192.0.2.2 ", "192.0.2.1", "192.0.2.1"),
+        ],
+        deltas=[
+            {
+                "from_serial": 2026091900,
+                "to_serial": 2026091901,
+                "deletes": [_rr("www.example.com.", "A", "in", 300, " 192.0.2.1 ")],
+                "adds": [_rr("_DMARC.example.com.", "txt", "IN", 600, '"v=DMARC1"')],
+            },
+        ],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["final_serial"] == 2026091901
+    # 快照按 (owner, type, class, ttl) 字典序："_dmarc" 的 "_" 排在 "www" 之前
+    assert body["snapshot"] == [
+        {"owner": "_dmarc.example.com", "type": "TXT", "class": "IN", "ttl": 600,
+         "rdata": ['"v=DMARC1"']},
+        {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+         "rdata": ["192.0.2.2"]},
+    ]
+
+
+def test_ixfr_replay_delete_then_add_same_rr_in_one_delta(client):
+    # 同一 delta 内先删后增同一 (owner,type,class,rdata)：TTL 变更场景
+    payload = _ixfr_payload(
+        initial_rrsets=[_rrset("www.example.com", "A", "IN", 300, "192.0.2.1")],
+        deltas=[
+            {
+                "from_serial": 2026091900,
+                "to_serial": 2026091901,
+                "deletes": [_rr("www.example.com", "A", "IN", 300, "192.0.2.1")],
+                "adds": [_rr("www.example.com", "A", "IN", 600, "192.0.2.1")],
+            },
+        ],
+    )
+    body = client.post("/api/zones/example.com/ixfr-replays", json=payload).json()
+    assert body["snapshot"] == [
+        {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 600,
+         "rdata": ["192.0.2.1"]}
+    ]
+
+
+def test_ixfr_replay_empty_delta_only_advances_serial(client):
+    # 不含任何 RR 操作的 delta 合法：仅推进 serial
+    payload = _ixfr_payload(
+        initial_rrsets=[],
+        deltas=[{"from_serial": 2026091900, "to_serial": 2026091901}],
+    )
+    body = client.post("/api/zones/example.com/ixfr-replays", json=payload).json()
+    assert body["final_serial"] == 2026091901
+    assert body["steps"] == [
+        {"index": 0, "from_serial": 2026091900, "to_serial": 2026091901,
+         "deleted": 0, "added": 0}
+    ]
+    assert body["snapshot"] == []
+
+
+def test_ixfr_replay_wraparound_advance(client):
+    # 4294967295 -> 0 为回绕有效前进
+    payload = _ixfr_payload(
+        start_serial=MAX_SERIAL,
+        initial_rrsets=[],
+        deltas=[
+            {"from_serial": MAX_SERIAL, "to_serial": 0,
+             "adds": [_rr("www.example.com", "A", "IN", 300, "192.0.2.1")]},
+            {"from_serial": 0, "to_serial": 1},
+        ],
+    )
+    body = client.post("/api/zones/example.com/ixfr-replays", json=payload).json()
+    assert body["final_serial"] == 1
+    assert [s["to_serial"] for s in body["steps"]] == [0, 1]
+
+
+def test_ixfr_replay_delete_missing_rr_409_atomic(client):
+    # delta 1 先删一条存在的 RR、再删一条不存在的 RR：
+    # 409 且快照必须保持该 delta 前的完整状态（不留半步修改）
+    payload = _ixfr_payload(
+        deltas=[
+            {
+                "from_serial": 2026091900,
+                "to_serial": 2026091901,
+                "deletes": [_rr("old.example.com", "A", "IN", 300, "192.0.2.9")],
+                "adds": [_rr("www.example.com", "A", "IN", 300, "192.0.2.2")],
+            },
+            {
+                "from_serial": 2026091901,
+                "to_serial": 2026091902,
+                "deletes": [
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.2"),  # 存在，会先被删掉
+                    _rr("mail.example.com", "A", "IN", 300, "192.0.2.5"),  # 不存在 → 409
+                ],
+                "adds": [],
+            },
+        ],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "delete_missing_rr"
+    assert detail["delta_index"] == 1
+    assert detail["current_serial"] == 2026091901
+    assert detail["from_serial"] == 2026091901
+    assert detail["to_serial"] == 2026091902
+    assert detail["operation"] == {
+        "action": "delete",
+        "rr_index": 1,
+        "rr": {"owner": "mail.example.com", "type": "A", "class": "IN",
+               "ttl": 300, "rdata": "192.0.2.5"},
+    }
+    # 该 delta 整体作废：快照仍是 delta 1 应用前的状态（www 两条都在）
+    assert detail["snapshot"] == [
+        {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+         "rdata": ["192.0.2.1", "192.0.2.2"]}
+    ]
+    # 仅 delta 0 完整应用
+    assert detail["steps"] == [
+        {"index": 0, "from_serial": 2026091900, "to_serial": 2026091901,
+         "deleted": 1, "added": 1}
+    ]
+
+
+def test_ixfr_replay_add_existing_rr_409(client):
+    # delta 1 新增一条自初始状态就存在的 RR
+    payload = _ixfr_payload(
+        deltas=[
+            {"from_serial": 2026091900, "to_serial": 2026091901},
+            {
+                "from_serial": 2026091901,
+                "to_serial": 2026091902,
+                "deletes": [],
+                "adds": [_rr("www.example.com", "A", "IN", 300, "192.0.2.1")],
+            },
+        ],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "add_existing_rr"
+    assert detail["delta_index"] == 1
+    assert detail["operation"]["action"] == "add"
+    assert detail["operation"]["rr_index"] == 0
+    assert detail["operation"]["rr"]["rdata"] == "192.0.2.1"
+    # 快照为该 delta 前的完整状态
+    assert (len(detail["snapshot"]) == 2
+            and detail["steps"] == [
+                {"index": 0, "from_serial": 2026091900, "to_serial": 2026091901,
+                 "deleted": 0, "added": 0}
+            ])
+
+
+def test_ixfr_replay_duplicate_delete_in_same_delta_409(client):
+    # 同一 delta 的 deletes 中重复删除同一 RR：第二次按"不存在"失败
+    payload = _ixfr_payload(
+        initial_rrsets=[_rrset("www.example.com", "A", "IN", 300, "192.0.2.1")],
+        deltas=[
+            {
+                "from_serial": 2026091900,
+                "to_serial": 2026091901,
+                "deletes": [
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.1"),
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.1"),
+                ],
+            },
+        ],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "delete_missing_rr"
+    assert detail["operation"]["rr_index"] == 1
+    # 半步修改不外泄：快照仍是初始状态
+    assert detail["snapshot"] == [
+        {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+         "rdata": ["192.0.2.1"]}
+    ]
+    assert detail["steps"] == []
+
+
+def test_ixfr_replay_duplicate_add_in_same_delta_409(client):
+    # 同一 delta 的 adds 中重复新增同一 RR：第二次按"已存在"失败
+    payload = _ixfr_payload(
+        initial_rrsets=[],
+        deltas=[
+            {
+                "from_serial": 2026091900,
+                "to_serial": 2026091901,
+                "adds": [
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.1"),
+                    _rr("www.example.com", "A", "IN", 300, "192.0.2.1"),
+                ],
+            },
+        ],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 409
+    detail = resp.json()["detail"]
+    assert detail["reason"] == "add_existing_rr"
+    assert detail["operation"]["rr_index"] == 1
+    assert detail["snapshot"] == []
+
+
+def test_ixfr_replay_first_delta_wrong_from_serial_422(client):
+    payload = _ixfr_payload(
+        deltas=[{"from_serial": 2026091999, "to_serial": 2026091901}],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 422
+
+
+def test_ixfr_replay_chain_break_422(client):
+    # delta 1 的 from_serial 不等于 delta 0 的 to_serial
+    payload = _ixfr_payload(
+        deltas=[
+            {"from_serial": 2026091900, "to_serial": 2026091901},
+            {"from_serial": 2026091900, "to_serial": 2026091902},
+        ],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 422
+
+
+@pytest.mark.parametrize(
+    "from_serial,to_serial",
+    [
+        (2026091900, 2026091900),            # 相等
+        (2026091901, 2026091900),            # 倒退
+        (0, SERIAL_HALF),                    # 相距恰好 2^31，不可比较
+        (0, SERIAL_HALF + 1),                # 越过半区间，倒退
+    ],
+)
+def test_ixfr_replay_to_serial_not_advance_422(client, from_serial, to_serial):
+    payload = _ixfr_payload(
+        start_serial=from_serial,
+        deltas=[{"from_serial": from_serial, "to_serial": to_serial}],
+    )
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 422
+
+
+def test_ixfr_replay_not_persisted(client):
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=_ixfr_payload())
+    assert resp.status_code == 200
+    assert client.get("/api/audits").json() == []
+    assert client.get("/api/zones/example.com/serial-reservations").json() == []
+
+
+def test_ixfr_replay_invalid_zone_400(client):
+    resp = client.post("/api/zones/bad_zone!/ixfr-replays", json=_ixfr_payload())
+    assert resp.status_code == 400
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _ixfr_payload(deltas=[]),                                   # 空 delta 列表
+        _ixfr_payload(start_serial=-1),                             # start_serial 下越界
+        _ixfr_payload(start_serial=MAX_SERIAL + 1),                 # start_serial 上越界
+        _ixfr_payload(deltas=[{"from_serial": 2026091900}]),        # 缺 to_serial
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": MAX_SERIAL + 1}]),      # to_serial 越界
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": 2026091901,
+                               "deletes": [_rr("bad_owner!", "A", "IN", 300, "x")]}]),
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": 2026091901,
+                               "adds": [_rr("www.example.com", "?", "IN", 300, "x")]}]),
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": 2026091901,
+                               "adds": [_rr("www.example.com", "A", "?", 300, "x")]}]),
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": 2026091901,
+                               "adds": [_rr("www.example.com", "A", "IN", -1, "x")]}]),
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": 2026091901,
+                               "adds": [_rr("www.example.com", "A", "IN", 2**31, "x")]}]),
+        _ixfr_payload(deltas=[{"from_serial": 2026091900,
+                               "to_serial": 2026091901,
+                               "adds": [_rr("www.example.com", "A", "IN", 300, "  ")]}]),
+        _ixfr_payload(initial_rrsets=[                              # 初始 RRset 键重复
+            _rrset("www.example.com", "A", "IN", 300, "192.0.2.1"),
+            _rrset("www.example.com", "A", "IN", 600, "192.0.2.2"),
+        ]),
+        _ixfr_payload(initial_rrsets=[
+            _rrset("www.example.com", "A", "IN", 300)]),            # 初始 RRset rdata 空列表
+        {"deltas": [{"from_serial": 0, "to_serial": 1}]},           # 缺 start_serial
+        "not-an-object",                                            # 请求体非对象
+    ],
+)
+def test_ixfr_replay_invalid_body_422(client, payload):
+    resp = client.post("/api/zones/example.com/ixfr-replays", json=payload)
+    assert resp.status_code == 422
+
+
 # ---------- 并发：串行化分配，不重复 serial ----------
 
 def test_concurrent_reservations_no_duplicate_serials(tmp_path):

@@ -12,6 +12,7 @@
 - 提供 **区域传送收敛预演**（`POST /api/zones/{zone}/transfer-simulations`，仅预演不写库）：给定各节点当前 serial、有向传送边、源节点与发布 serial，模拟第 0 轮源节点发布后的逐轮同步传播（每节点只从上一轮上游中选择相对自身为 RFC 1982 有效前进且前向距离最小的值，距离并列按上游名排序，所有节点同时更新），返回逐轮变更、最终快照与未收敛节点；达到 `max_rounds` 后仍有节点可更新时返回 **409** 并携带当前快照。
 - 提供 **多源观测 serial 时间线重建**（`POST /api/zones/{zone}/serial-timelines`，仅计算不写库）：接收多个采集源（collector）在不同时刻上报的 SOA serial，按 `bucket_seconds` 做时间桶聚合，桶内同一采集源只取 `observed_at` 最新观测（最新时刻出现不同 serial 返回 **422**）；再用动态规划从各桶候选值中选出一条相邻桶只含 RFC 1982 相等或有效前进关系的时间线，目标依次为最大化采集源支持数、最少跳变、完全并列按整条 serial 序列字典序升序；倒退与不可比较一律禁止，首个无法延续的桶返回 **409** 并给出冲突位置与最优前缀。
 - 提供 **权威快照一致性检查**（`POST /api/zones/{zone}/snapshot-consistency`，仅检查不写库）：接收多个权威节点的 RRset 快照（owner、type、class、ttl、rdata）与最小同意节点数 `min_agreeing`，将属主名规范化为小写无尾点、类型与类大写、rdata 去重排序后，按 RRset 统计各取值（含"缺席"）的同意节点数，取**唯一最高票**且达到门槛的值为共识；返回可发布的共识快照、逐节点差异（mismatch/missing/extra）与冲突 RRset；任一 RRset 最高票未达门槛或达到门槛但并列时返回 **409** 并列出各取值的投票分布。
+- 提供 **IXFR 增量回放预演**（`POST /api/zones/{zone}/ixfr-replays`，仅预演不写库）：提交起始 serial、初始 RRset 集合与有序 delta 列表，校验 serial 链（每个 delta 的 `from_serial` 必须等于当前 serial、`to_serial` 必须为 RFC 1982 有效前进），RR 规范化后以 `(owner, type, class, ttl, rdata)` 五元组为同一性判据，单个 delta 内**先删除再新增**；删除不存在的 RR 或新增已存在的 RR 时返回 **409** 并给出 delta 下标、失败操作与该 delta 前的完整快照（该 delta 原子作废，不留半步修改）；成功时返回最终 serial、规范化快照与每步增删计数。
 
 ## 快速启动（单条命令）
 
@@ -49,6 +50,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `POST` | `/api/zones/{zone}/transfer-simulations` | 区域传送收敛预演，不写库（200；达到轮次上限仍可更新返回 409） |
 | `POST` | `/api/zones/{zone}/serial-timelines` | 多源观测 serial 时间线重建，不写库（200；桶内最新观测冲突 422；无法延续 409） |
 | `POST` | `/api/zones/{zone}/snapshot-consistency` | 权威快照一致性检查，不写库（200；任一 RRset 未达成唯一多数共识返回 409） |
+| `POST` | `/api/zones/{zone}/ixfr-replays` | IXFR 增量回放预演，不写库（200；删除不存在/新增已存在的 RR 返回 409；serial 链非法返回 422） |
 | `GET` | `/health` | 健康检查 |
 
 ### 提交审计
@@ -560,6 +562,95 @@ curl -s -X POST http://localhost:8000/api/zones/example.com/snapshot-consistency
 
 - 节点名重复/空白、`min_agreeing` 越界（小于 1 或大于节点数）、节点内 RRset 键重复、`rdata` 为空列表或含空白串、`ttl` 越界、属主/类型/类非法等请求问题返回 **422**；路径中区域名非法返回 **400**。
 
+### IXFR 增量回放预演
+
+`POST /api/zones/{zone}/ixfr-replays` 用于**发布前**回放一组 IXFR 增量：提交起始 serial、初始 RRset 集合与按应用顺序排列的 delta 列表，服务端在内存中逐步回放，返回最终 serial、规范化快照与每步增删计数。结果**不写入数据库**（不会产生审计或预留记录）。
+
+请求体：
+
+| 字段 | 说明 |
+| --- | --- |
+| `start_serial` | 回放起始 serial（`0..4294967295`）；首个 delta 的 `from_serial` 必须等于它 |
+| `initial_rrsets` | 初始 RRset 列表（可空、至多 4096 条）；字段与快照一致性检查相同（`owner`/`type`/`class`/`ttl`/`rdata` 列表），`(owner, type, class)` 键须唯一，展开为 RR 集合作为回放起点 |
+| `deltas` | 有序 IXFR 增量列表（至少 1 个、至多 4096 个）；每项含 `from_serial`、`to_serial`、`deletes`（RR 列表，可空）、`adds`（RR 列表，可空） |
+
+每条 RR 操作字段：`owner`、`type`、`class`、`ttl`（`0..2147483647`）与单条 `rdata`。规则：
+
+- **serial 链**：第 i 个 delta 的 `from_serial` 必须等于当前 serial（首个为 `start_serial`，其后为上一 delta 的 `to_serial`）；`to_serial` 相对 `from_serial` 必须是 RFC 1982 **有效前进**（相等/倒退/相距恰好 `2^31` 的不可比较均不允许，`4294967295 → 0` 这类回绕前进合法）。链式校验失败返回 **422**；
+- **RR 规范化与同一性**：属主名去首尾空白、去末尾根点并转小写（允许前导下划线标签），类型/类转大写，rdata 去首尾空白；RR 以规范化后的 `(owner, type, class, ttl, rdata)` **五元组**为同一性判据；
+- **单个 delta 先删除再新增**：删除的 RR 必须已存在、新增的 RR 必须不存在；同一 delta 内先删后增可用于替换同一 RR（例如 TTL 变更）。删除/新增逐条按请求顺序应用——同一 delta 的 `deletes` 中重复删除同一 RR，第二次会因"不存在"而失败；
+- **delta 原子性**：任一操作冲突时该 delta **整体作废**，返回 **409**，响应携带的 `snapshot` 是该 delta 应用**之前**的最后一次完整快照，不含任何半步修改。
+
+```bash
+curl -s -X POST http://localhost:8000/api/zones/example.com/ixfr-replays \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "start_serial": 2026091900,
+        "initial_rrsets": [
+          {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+           "rdata": ["192.0.2.1"]},
+          {"owner": "old.example.com", "type": "A", "class": "IN", "ttl": 300,
+           "rdata": ["192.0.2.9"]}
+        ],
+        "deltas": [
+          {"from_serial": 2026091900, "to_serial": 2026091901,
+           "deletes": [{"owner": "old.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.9"}],
+           "adds":    [{"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.2"}]},
+          {"from_serial": 2026091901, "to_serial": 2026091902,
+           "deletes": [{"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.1"},
+                       {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.2"}],
+           "adds":    [{"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 600, "rdata": "192.0.2.1"},
+                       {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 600, "rdata": "192.0.2.2"}]}
+        ]
+      }'
+```
+
+```json
+{
+  "zone": "example.com",
+  "start_serial": 2026091900,
+  "final_serial": 2026091902,
+  "deltas_applied": 2,
+  "steps": [
+    {"index": 0, "from_serial": 2026091900, "to_serial": 2026091901, "deleted": 1, "added": 1},
+    {"index": 1, "from_serial": 2026091901, "to_serial": 2026091902, "deleted": 2, "added": 2}
+  ],
+  "snapshot": [
+    {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 600,
+     "rdata": ["192.0.2.1", "192.0.2.2"]}
+  ],
+  "note": "回放结果仅用于发布前预演，不写入数据库；RR 以规范化后的 (owner, type, class, ttl, rdata) 五元组为同一性判据，每个 delta 内先删除再新增，任一操作冲突则该 delta 整体作废"
+}
+```
+
+- `steps[]` 给出每个已完整应用 delta 的增删计数（`deleted`/`added`）；`snapshot` 为回放完成后的规范化快照，按 `(owner, type, class, ttl)` 分组、字典序排列，组内 rdata 去重排序；
+- **RR 操作冲突（409）**：删除不存在的 RR（`delete_missing_rr`）或新增已存在的 RR（`add_existing_rr`）时返回 **409**，`detail` 给出 `delta_index`、失败操作（`operation.action`/`rr_index`/规范化后的 `rr`）、该 delta 前的当前 serial 与完整快照，以及失败前已完整应用的各步计数。下例中 delta 1 先删掉了 `192.0.2.2`、再删不存在的 `mail` 记录而失败——响应快照仍是 delta 1 之前的状态（`192.0.2.2` 仍在），半步修改不会外泄：
+
+```json
+{
+  "detail": {
+    "reason": "delete_missing_rr",
+    "message": "第 1 个 delta 删除的第 1 条 RR（mail.example.com 300 IN A 192.0.2.5）在当前快照中不存在",
+    "zone": "example.com",
+    "delta_index": 1,
+    "current_serial": 2026091901,
+    "from_serial": 2026091901,
+    "to_serial": 2026091902,
+    "operation": {"action": "delete", "rr_index": 1,
+                  "rr": {"owner": "mail.example.com", "type": "A", "class": "IN", "ttl": 300, "rdata": "192.0.2.5"}},
+    "steps": [
+      {"index": 0, "from_serial": 2026091900, "to_serial": 2026091901, "deleted": 1, "added": 1}
+    ],
+    "snapshot": [
+      {"owner": "www.example.com", "type": "A", "class": "IN", "ttl": 300,
+       "rdata": ["192.0.2.1", "192.0.2.2"]}
+    ]
+  }
+}
+```
+
+- 初始 RRset 键重复、`serial` 越界、`ttl` 越界、属主/类型/类非法、`rdata` 空白、`deltas` 为空等请求问题返回 **422**；路径中区域名非法返回 **400**。
+
 ## 判定规则（RFC 1982）
 
 serial 是模 `2^32` 环形空间上的值。设前向距离 `d = (current - previous) mod 2^32`：
@@ -598,6 +689,7 @@ app/
   transfer.py  # 区域传送收敛预演（不落库）
   timeline.py  # 多源观测 serial 时间线重建（不落库）
   snapshot.py  # 权威快照一致性检查（不落库）
+  ixfr.py      # IXFR 增量回放预演（不落库）
   service.py   # 逐项判定与汇总
   db.py        # SQLite 持久层（审计记录 + serial 预留的事务化分配与查询）
   schemas.py   # 请求/响应模型与校验

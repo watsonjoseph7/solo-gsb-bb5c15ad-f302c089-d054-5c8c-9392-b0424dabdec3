@@ -584,6 +584,14 @@ def validate_owner(value: str) -> str:
     return owner
 
 
+def normalize_rr_token(value: str) -> str:
+    """规范化记录类型/类助记符：去首尾空白、转大写后校验。"""
+    token = value.strip().upper()
+    if not token or not _RR_TOKEN_RE.match(token):
+        raise ValueError("非法的记录类型/类助记符")
+    return token
+
+
 class SnapshotRRset(BaseModel):
     """单条 RRset 快照：属主、类型、类、TTL 与记录数据集合。"""
 
@@ -628,10 +636,7 @@ class SnapshotRRset(BaseModel):
     @field_validator("type", "class_")
     @classmethod
     def _check_token(cls, value: str) -> str:
-        token = value.strip().upper()
-        if not token or not _RR_TOKEN_RE.match(token):
-            raise ValueError("非法的记录类型/类助记符")
-        return token
+        return normalize_rr_token(value)
 
     @field_validator("rdata")
     @classmethod
@@ -815,3 +820,201 @@ class SnapshotConsistencyConflictResponse(BaseModel):
     """存在冲突 RRset 时 409 响应体（HTTPException 的标准 detail 包装）。"""
 
     detail: SnapshotConsistencyConflictDetail
+
+
+# ---------- IXFR 增量回放预演 ----------
+
+
+class IxfrRR(BaseModel):
+    """单条资源记录（RR）：IXFR 回放中删除/新增操作的最小单位。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str = Field(
+        min_length=1,
+        max_length=253,
+        examples=["www.example.com"],
+        description="属主名（规范化：去首尾空白、去末尾根点、转小写；允许前导下划线标签）",
+    )
+    type: str = Field(
+        min_length=1,
+        max_length=15,
+        examples=["A"],
+        description="记录类型助记符（规范化：去首尾空白、转大写）",
+    )
+    class_: str = Field(
+        alias="class",
+        min_length=1,
+        max_length=15,
+        examples=["IN"],
+        description="记录类助记符（规范化：去首尾空白、转大写）",
+    )
+    ttl: int = Field(
+        ge=0,
+        le=2**31 - 1,
+        description="TTL 秒数（RFC 2181：31 位非负整数）",
+    )
+    rdata: str = Field(
+        min_length=1,
+        examples=["192.0.2.1"],
+        description="单条记录数据（规范化：去首尾空白，不能为空）",
+    )
+
+    @field_validator("owner")
+    @classmethod
+    def _check_owner(cls, value: str) -> str:
+        return validate_owner(value)
+
+    @field_validator("type", "class_")
+    @classmethod
+    def _check_token(cls, value: str) -> str:
+        return normalize_rr_token(value)
+
+    @field_validator("rdata")
+    @classmethod
+    def _check_rdata(cls, value: str) -> str:
+        text = value.strip()
+        if not text:
+            raise ValueError("rdata 不能为空字符串")
+        return text
+
+
+class IxfrDelta(BaseModel):
+    """一个有序 IXFR 增量：serial 前进一步，并先删除、再新增若干 RR。"""
+
+    from_serial: Serial = Field(
+        description="本增量应用前的 serial（必须等于当前 serial：首个为 start_serial，其后为上一 delta 的 to_serial）"
+    )
+    to_serial: Serial = Field(
+        description="本增量应用后的 serial（相对 from_serial 必须为 RFC 1982 有效前进）"
+    )
+    deletes: list[IxfrRR] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="本增量删除的 RR（在新增之前按顺序应用；逐条须存在于当前快照）",
+    )
+    adds: list[IxfrRR] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="本增量新增的 RR（在删除之后按顺序应用；逐条须不存在于删除后的快照）",
+    )
+
+
+class IxfrReplayCreate(BaseModel):
+    """IXFR 增量回放预演请求（仅预演，不写库）。"""
+
+    start_serial: Serial = Field(
+        description="回放起始 serial（首个 delta 的 from_serial 须等于它）"
+    )
+    initial_rrsets: list[SnapshotRRset] = Field(
+        default_factory=list,
+        max_length=4096,
+        description="初始 RRset 集合（(owner, type, class) 键须唯一；展开为 RR 集合作为回放起点）",
+    )
+    deltas: list[IxfrDelta] = Field(
+        min_length=1,
+        max_length=4096,
+        description="按应用顺序排列的 IXFR 增量（至少 1 个）",
+    )
+
+    @model_validator(mode="after")
+    def _check_rrset_keys_and_serial_chain(self) -> "IxfrReplayCreate":
+        seen: set[tuple[str, str, str]] = set()
+        for rrset in self.initial_rrsets:
+            key = (rrset.owner, rrset.type, rrset.class_)
+            if key in seen:
+                raise ValueError(
+                    f"初始 RRset 键重复: {key[0]}/{key[1]}/{key[2]}"
+                )
+            seen.add(key)
+
+        current = self.start_serial
+        for index, delta in enumerate(self.deltas):
+            if delta.from_serial != current:
+                raise ValueError(
+                    f"deltas[{index}].from_serial（{delta.from_serial}）"
+                    f"必须等于当前 serial（{current}）"
+                )
+            relation = classify(delta.from_serial, delta.to_serial)
+            if relation != "advance":
+                raise ValueError(
+                    f"deltas[{index}].to_serial（{delta.to_serial}）相对 from_serial"
+                    f"（{delta.from_serial}）不是 RFC 1982 有效前进（判定为 {relation}）"
+                )
+            current = delta.to_serial
+        return self
+
+
+class IxfrSnapshotRRset(BaseModel):
+    """回放快照中的一个 RRset：同一 (owner, type, class, ttl) 的 rdata 集合。"""
+
+    model_config = ConfigDict(populate_by_name=True)
+
+    owner: str
+    type: str
+    class_: str = Field(alias="class")
+    ttl: int
+    rdata: list[str] = Field(description="去重并按字典序排序的记录数据")
+
+
+class IxfrReplayStep(BaseModel):
+    """一个已完整应用的 delta 的增删计数。"""
+
+    index: int = Field(ge=0, description="delta 下标（从 0 起）")
+    from_serial: int
+    to_serial: int
+    deleted: int = Field(ge=0, description="本步删除的 RR 数")
+    added: int = Field(ge=0, description="本步新增的 RR 数")
+
+
+class IxfrReplayOut(BaseModel):
+    """全部 delta 回放成功（200）响应体。"""
+
+    zone: str
+    start_serial: int
+    final_serial: int = Field(description="最后一个 delta 的 to_serial")
+    deltas_applied: int = Field(ge=1, description="已完整应用的 delta 数")
+    steps: list[IxfrReplayStep] = Field(
+        description="每个 delta 的增删计数（按下标升序）"
+    )
+    snapshot: list[IxfrSnapshotRRset] = Field(
+        description="回放完成后的规范化快照（按 owner/type/class/ttl 字典序）"
+    )
+    note: str
+
+
+class IxfrFailedOperation(BaseModel):
+    """409 时导致回放失败的单条 RR 操作。"""
+
+    action: Literal["delete", "add"] = Field(description="失败操作类型：删除或新增")
+    rr_index: int = Field(
+        ge=0, description="该 RR 在 delta 的 deletes/adds 列表中的下标（从 0 起）"
+    )
+    rr: IxfrRR = Field(description="规范化后的 RR 五元组")
+
+
+class IxfrReplayConflictDetail(BaseModel):
+    """RR 操作冲突时 409 响应的 detail 结构。"""
+
+    reason: Literal["delete_missing_rr", "add_existing_rr"]
+    message: str
+    zone: str
+    delta_index: int = Field(
+        ge=0, description="回放失败的 delta 下标（其前的 delta 均已完整应用）"
+    )
+    current_serial: int = Field(description="该 delta 应用前的当前 serial")
+    from_serial: int = Field(description="该 delta 声明的 from_serial")
+    to_serial: int = Field(description="该 delta 声明的 to_serial")
+    operation: IxfrFailedOperation
+    steps: list[IxfrReplayStep] = Field(
+        description="失败 delta 之前已完整应用的各步增删计数"
+    )
+    snapshot: list[IxfrSnapshotRRset] = Field(
+        description="该 delta 应用前的最后一次完整快照（本 delta 整体作废，不含任何半步修改）"
+    )
+
+
+class IxfrReplayConflictResponse(BaseModel):
+    """RR 操作冲突时 409 响应体（HTTPException 的标准 detail 包装）。"""
+
+    detail: IxfrReplayConflictDetail
