@@ -7,11 +7,15 @@ from datetime import date, datetime, timezone
 from fastapi import FastAPI, HTTPException, Query, Response
 
 from . import db
+from .ixfr import IxfrReplayError, run_ixfr_replay
 from .rfc1982 import MAX_SERIAL
 from .schemas import (
     AuditCreate,
     AuditListItem,
     AuditOut,
+    IxfrReplayConflictResponse,
+    IxfrReplayCreate,
+    IxfrReplayOut,
     NextSerialOut,
     ReleasePlanConflictResponse,
     ReleasePlanCreate,
@@ -407,6 +411,65 @@ def create_app(db_path: str | None = None) -> FastAPI:
             "RRset 以 (owner, type, class) 为键，属主名规范化为小写无尾点、"
             "类型与类大写、rdata 去重并按字典序排序；共识值为唯一最高票且"
             "同意节点数达到 min_agreeing 的取值"
+        )
+        return result
+
+    @app.post(
+        "/api/zones/{zone}/ixfr-replays",
+        response_model=IxfrReplayOut,
+        responses={
+            409: {
+                "model": IxfrReplayConflictResponse,
+                "description": (
+                    "delta 的 from_serial 与当前 serial 不一致（serial_chain_broken）、"
+                    "to_serial 非 RFC 1982 有效前进（invalid_serial_advance）、"
+                    "删除不存在的 RR（delete_missing_rr）或新增已存在的 RR"
+                    "（add_existing_rr）；detail 给出 delta 下标、失败操作与该 delta "
+                    "前的最后一次完整快照，失败的 delta 不保留半步修改"
+                ),
+            }
+        },
+    )
+    def create_ixfr_replay(zone: str, payload: IxfrReplayCreate) -> dict:
+        """IXFR 增量回放预演（发布前验证，不写库）。
+
+        从 ``start_serial`` 与初始 RRset 快照出发按序回放：每个 delta 的
+        ``from_serial`` 必须等于当前 serial，``to_serial`` 必须相对当前 serial
+        构成 RFC 1982 有效前进；RR 统一规范化后，单个 delta 先删除再新增——
+        删除不存在的 RR 或新增已存在的 RR 时该 delta 整体失败（不保留半步
+        修改），返回 409 并携带 delta 下标、失败操作与该 delta 前的最后一次
+        完整快照。成功时返回最终 serial、每步增删计数与最终规范化快照。
+        """
+        zone_name = _normalize_zone(zone)
+        initial = [
+            (rrset.owner, rrset.type, rrset.class_, rrset.ttl, tuple(rrset.rdata))
+            for rrset in payload.initial
+        ]
+        deltas = [
+            (
+                delta.from_serial,
+                delta.to_serial,
+                [
+                    (rr.owner, rr.type, rr.class_, rr.ttl, rr.rdata)
+                    for rr in delta.delete
+                ],
+                [
+                    (rr.owner, rr.type, rr.class_, rr.ttl, rr.rdata)
+                    for rr in delta.add
+                ],
+            )
+            for delta in payload.deltas
+        ]
+        try:
+            result = run_ixfr_replay(
+                zone_name, payload.start_serial, initial, deltas
+            )
+        except IxfrReplayError as exc:
+            raise HTTPException(status_code=409, detail=exc.detail) from exc
+        result["note"] = (
+            "回放结果仅用于发布前验证，不写入数据库；RR 以 "
+            "(owner, type, class, ttl, rdata) 为身份统一规范化，每个 delta "
+            "先删除再新增，任一步失败即整体放弃该 delta"
         )
         return result
 
