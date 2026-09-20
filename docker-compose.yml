@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DNS_AUDIT_DB: /data/audits.db
+    volumes:
+      - dns-audit-data:/data
+    restart: unless-stopped
+
+volumes:
+  dns-audit-data:
